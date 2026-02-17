@@ -1,4 +1,3 @@
-use rustc_hash::FxHashMap;
 use crate::arithmetic::{AEnc, ADec};
 use crate::charfreq::CHAR_FREQ;
 use crate::fnv::fnv;
@@ -6,8 +5,11 @@ use crate::fnv::fnv;
 const MAX_ORD: usize = 6;
 const DISCOUNT: f64 = 0.85;
 
-/// Compact symbol-count map. Stores up to ~256 entries inline.
-/// Uses a flat Vec<(u8, u32)> for small sizes (fast iteration, cache-friendly).
+// ── Open-addressing hash table: u32 -> SymCounts ──
+
+const EMPTY_KEY: u32 = u32::MAX;
+
+/// Compact symbol-count map using flat Vec for cache-friendly iteration.
 struct SymCounts {
     entries: Vec<(u8, u32)>,
 }
@@ -16,7 +18,7 @@ impl SymCounts {
     #[inline]
     fn new() -> Self {
         Self {
-            entries: Vec::with_capacity(4),
+            entries: Vec::new(), // zero alloc until first push
         }
     }
 
@@ -56,11 +58,111 @@ impl SymCounts {
     }
 }
 
+/// Open-addressing hash table with linear probing. u32 keys -> SymCounts values.
+/// Keys and values in separate arrays: probing only touches the keys array
+/// (4 bytes each, 16 keys per cache line), values accessed only on hit.
+struct CtxTable {
+    keys: Vec<u32>,
+    vals: Vec<SymCounts>,
+    mask: usize,
+    len: usize,
+}
+
+impl CtxTable {
+    fn new() -> Self {
+        let cap = 64; // small initial size, grows as needed
+        Self {
+            keys: vec![EMPTY_KEY; cap],
+            vals: (0..cap).map(|_| SymCounts::new()).collect(),
+            mask: cap - 1,
+            len: 0,
+        }
+    }
+
+    #[inline(always)]
+    fn fix_key(key: u32) -> u32 {
+        if key == EMPTY_KEY { key.wrapping_sub(1) } else { key }
+    }
+
+    #[inline]
+    fn get(&self, key: u32) -> Option<&SymCounts> {
+        let key = Self::fix_key(key);
+        let mut idx = (key as usize) & self.mask;
+        loop {
+            let k = unsafe { *self.keys.get_unchecked(idx) };
+            if k == key {
+                return Some(unsafe { self.vals.get_unchecked(idx) });
+            }
+            if k == EMPTY_KEY {
+                return None;
+            }
+            idx = (idx + 1) & self.mask;
+        }
+    }
+
+    #[inline]
+    fn get_or_insert(&mut self, key: u32) -> &mut SymCounts {
+        let key = Self::fix_key(key);
+        if self.len * 2 >= self.mask + 1 {
+            self.grow();
+        }
+        let mut idx = (key as usize) & self.mask;
+        loop {
+            let k = unsafe { *self.keys.get_unchecked(idx) };
+            if k == key {
+                return unsafe { self.vals.get_unchecked_mut(idx) };
+            }
+            if k == EMPTY_KEY {
+                unsafe { *self.keys.get_unchecked_mut(idx) = key; }
+                self.len += 1;
+                return unsafe { self.vals.get_unchecked_mut(idx) };
+            }
+            idx = (idx + 1) & self.mask;
+        }
+    }
+
+    fn grow(&mut self) {
+        let new_cap = (self.mask + 1) * 2;
+        let new_mask = new_cap - 1;
+        let mut new_keys = vec![EMPTY_KEY; new_cap];
+        let mut new_vals: Vec<SymCounts> = (0..new_cap).map(|_| SymCounts::new()).collect();
+
+        for old_idx in 0..=self.mask {
+            if self.keys[old_idx] != EMPTY_KEY {
+                let k = self.keys[old_idx];
+                let mut idx = (k as usize) & new_mask;
+                loop {
+                    if new_keys[idx] == EMPTY_KEY {
+                        new_keys[idx] = k;
+                        std::mem::swap(&mut new_vals[idx], &mut self.vals[old_idx]);
+                        break;
+                    }
+                    idx = (idx + 1) & new_mask;
+                }
+            }
+        }
+
+        self.keys = new_keys;
+        self.vals = new_vals;
+        self.mask = new_mask;
+    }
+
+    fn values_mut(&mut self) -> impl Iterator<Item = &mut SymCounts> {
+        self.keys
+            .iter()
+            .zip(self.vals.iter_mut())
+            .filter(|(&k, _)| k != EMPTY_KEY)
+            .map(|(_, v)| v)
+    }
+}
+
+// ── PPM Model ──
+
 /// PPM model with Kneser-Ney smoothing (no escapes — all orders interpolated).
 pub struct PPM {
     mo: usize,
     /// ctx[order] maps context_hash -> symbol counts
-    ctx: Vec<FxHashMap<u32, SymCounts>>,
+    ctx: Vec<CtxTable>,
     hist: Vec<u8>,
     /// Set after pretrain: unigram frequencies from training data
     base_freq: Option<[u32; 256]>,
@@ -70,7 +172,7 @@ impl PPM {
     pub fn new(max_order: usize) -> Self {
         let mut ctx = Vec::with_capacity(max_order + 1);
         for _ in 0..=max_order {
-            ctx.push(FxHashMap::default());
+            ctx.push(CtxTable::new());
         }
         Self {
             mo: max_order,
@@ -101,8 +203,7 @@ impl PPM {
                 Some(h) => h,
                 None => continue,
             };
-            let tbl = &mut self.ctx[order];
-            let d = tbl.entry(h).or_insert_with(SymCounts::new);
+            let d = self.ctx[order].get_or_insert(h);
             d.increment(byte);
         }
         self.hist.push(byte);
@@ -113,8 +214,7 @@ impl PPM {
         let limit = std::cmp::min(self.mo + 1, max_order);
         for order in 0..limit {
             let h = order_hashes[order];
-            let tbl = &mut self.ctx[order];
-            let d = tbl.entry(h).or_insert_with(SymCounts::new);
+            let d = self.ctx[order].get_or_insert(h);
             d.increment(byte);
         }
         self.hist.push(byte);
@@ -131,8 +231,7 @@ impl PPM {
         }
         self.base_freq = Some(base);
 
-        // Dampen pretrain counts: sqrt preserves common patterns while
-        // reducing rare ones, allowing faster adaptation to novel text
+        // Dampen pretrain counts
         for order in 0..=self.mo {
             for d in self.ctx[order].values_mut() {
                 for count in d.values_mut() {
@@ -215,7 +314,6 @@ impl PPM {
 
     /// Compute KN-smoothed float distribution over all 256 bytes.
     pub(crate) fn distribution_f(&self) -> [f64; 256] {
-        // Compute hashes internally
         let mut hashes = [0u32; 7];
         let n = self.hist.len();
         let max_order = std::cmp::min(self.mo + 1, n + 1);
@@ -238,7 +336,6 @@ impl PPM {
             Some(bf) => bf,
             None => &CHAR_FREQ,
         };
-        // Compute class_base ONCE and reuse for both base mix and safety floor
         let class_base = self.class_base();
 
         let mut mixed = [0u32; 256];
@@ -257,7 +354,7 @@ impl PPM {
         let limit = std::cmp::min(self.mo + 1, max_order);
         for order in 0..limit {
             let h = order_hashes[order];
-            let d = match self.ctx[order].get(&h) {
+            let d = match self.ctx[order].get(h) {
                 Some(d) => d,
                 None => continue,
             };
@@ -269,12 +366,10 @@ impl PPM {
             let inv_c_total = 1.0 / c_total as f64;
             let lam = DISCOUNT * n_unique * inv_c_total;
 
-            // Sparse iteration: start with backoff scaled by lambda
             let mut new_dist = [0.0f64; 256];
             for b in 0..256 {
                 new_dist[b] = lam * dist[b];
             }
-            // Add direct counts only for symbols present in context
             for &(sym, count) in d.iter() {
                 let direct = (count as f64 - DISCOUNT).max(0.0) * inv_c_total;
                 new_dist[sym as usize] += direct;
@@ -282,9 +377,8 @@ impl PPM {
             dist = new_dist;
         }
 
-        // Post-KN safety floor — reuse the same mixed[] and freq_total
         let eps = 0.10f64;
-        let inv_safety_total = inv_freq_total; // same values
+        let inv_safety_total = inv_freq_total;
         for b in 0..256 {
             dist[b] = (1.0 - eps) * dist[b] + eps * mixed[b] as f64 * inv_safety_total;
         }
