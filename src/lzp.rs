@@ -3,6 +3,7 @@ use crate::fnv::fnv;
 
 /// LZP longest-match predictor.
 /// table[hash] = pos where pos is the position of the byte that FOLLOWED the hashed context.
+#[derive(Clone)]
 pub struct LZP {
     pub hist: Vec<u8>,
     table: FxHashMap<u32, usize>,

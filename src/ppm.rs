@@ -10,6 +10,7 @@ const DISCOUNT: f64 = 0.85;
 const EMPTY_KEY: u32 = u32::MAX;
 
 /// Compact symbol-count map using flat Vec for cache-friendly iteration.
+#[derive(Clone)]
 struct SymCounts {
     entries: Vec<(u8, u32)>,
 }
@@ -61,6 +62,7 @@ impl SymCounts {
 /// Open-addressing hash table with linear probing. u32 keys -> SymCounts values.
 /// Keys and values in separate arrays: probing only touches the keys array
 /// (4 bytes each, 16 keys per cache line), values accessed only on hit.
+#[derive(Clone)]
 struct CtxTable {
     keys: Vec<u32>,
     vals: Vec<SymCounts>,
@@ -159,6 +161,7 @@ impl CtxTable {
 // ── PPM Model ──
 
 /// PPM model with Kneser-Ney smoothing (no escapes — all orders interpolated).
+#[derive(Clone)]
 pub struct PPM {
     mo: usize,
     /// ctx[order] maps context_hash -> symbol counts

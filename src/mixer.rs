@@ -72,6 +72,7 @@ fn squash_fast(x: f64) -> f64 {
 }
 
 /// Context mixer with 13 models, linear mixing + residual NN correction.
+#[derive(Clone)]
 pub struct ContextMixer {
     mo: usize,
     pub(crate) ppm: PPM,

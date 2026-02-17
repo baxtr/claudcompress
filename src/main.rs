@@ -18,6 +18,9 @@ enum Commands {
         /// Output file (default: <file>.cqz)
         #[arg(short, long)]
         output: Option<PathBuf>,
+        /// Number of threads (default: auto-detect)
+        #[arg(short, long, default_value_t = 0)]
+        threads: usize,
     },
     /// Decompress a .cqz file
     Decompress {
@@ -26,11 +29,17 @@ enum Commands {
         /// Output file (default: strip .cqz extension)
         #[arg(short, long)]
         output: Option<PathBuf>,
+        /// Number of threads (default: auto-detect)
+        #[arg(short, long, default_value_t = 0)]
+        threads: usize,
     },
     /// Show compression ratio without writing output
     Ratio {
         /// Input file
         file: PathBuf,
+        /// Number of threads (default: auto-detect)
+        #[arg(short, long, default_value_t = 0)]
+        threads: usize,
     },
 }
 
@@ -38,12 +47,12 @@ fn main() {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Compress { file, output } => {
+        Commands::Compress { file, output, threads } => {
             let text = fs::read_to_string(&file).unwrap_or_else(|e| {
                 eprintln!("Error reading {}: {e}", file.display());
                 std::process::exit(1);
             });
-            let compressed = claudcompress::quantum_compress(&text);
+            let compressed = claudcompress::quantum_compress_threads(&text, threads);
             let out_path = output.unwrap_or_else(|| {
                 let mut p = file.clone();
                 let name = format!("{}.cqz", p.file_name().unwrap().to_string_lossy());
@@ -56,12 +65,12 @@ fn main() {
             });
             eprintln!("  Written to {}", out_path.display());
         }
-        Commands::Decompress { file, output } => {
+        Commands::Decompress { file, output, threads } => {
             let data = fs::read(&file).unwrap_or_else(|e| {
                 eprintln!("Error reading {}: {e}", file.display());
                 std::process::exit(1);
             });
-            let text = claudcompress::quantum_decompress(&data).unwrap_or_else(|e| {
+            let text = claudcompress::quantum_decompress_threads(&data, threads).unwrap_or_else(|e| {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             });
@@ -82,12 +91,12 @@ fn main() {
             });
             eprintln!("  Written to {}", out_path.display());
         }
-        Commands::Ratio { file } => {
+        Commands::Ratio { file, threads } => {
             let text = fs::read_to_string(&file).unwrap_or_else(|e| {
                 eprintln!("Error reading {}: {e}", file.display());
                 std::process::exit(1);
             });
-            let _ = claudcompress::quantum_compress(&text);
+            let _ = claudcompress::quantum_compress_threads(&text, threads);
         }
     }
 }
