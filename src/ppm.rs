@@ -6,11 +6,61 @@ use crate::fnv::fnv;
 const MAX_ORD: usize = 6;
 const DISCOUNT: f64 = 0.85;
 
+/// Compact symbol-count map. Stores up to ~256 entries inline.
+/// Uses a flat Vec<(u8, u32)> for small sizes (fast iteration, cache-friendly).
+struct SymCounts {
+    entries: Vec<(u8, u32)>,
+}
+
+impl SymCounts {
+    #[inline]
+    fn new() -> Self {
+        Self {
+            entries: Vec::with_capacity(4),
+        }
+    }
+
+    #[inline]
+    fn increment(&mut self, sym: u8) {
+        for entry in self.entries.iter_mut() {
+            if entry.0 == sym {
+                entry.1 += 1;
+                return;
+            }
+        }
+        self.entries.push((sym, 1));
+    }
+
+    #[inline]
+    fn total(&self) -> u32 {
+        let mut s = 0u32;
+        for &(_, c) in &self.entries {
+            s += c;
+        }
+        s
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[inline]
+    fn iter(&self) -> std::slice::Iter<(u8, u32)> {
+        self.entries.iter()
+    }
+
+    #[inline]
+    fn values_mut(&mut self) -> impl Iterator<Item = &mut u32> {
+        self.entries.iter_mut().map(|(_, c)| c)
+    }
+}
+
 /// PPM model with Kneser-Ney smoothing (no escapes — all orders interpolated).
 pub struct PPM {
     mo: usize,
-    /// ctx[order] maps context_hash -> (symbol -> count)
-    ctx: Vec<FxHashMap<u32, FxHashMap<u8, u32>>>,
+    /// ctx[order] maps context_hash -> symbol counts
+    ctx: Vec<FxHashMap<u32, SymCounts>>,
     hist: Vec<u8>,
     /// Set after pretrain: unigram frequencies from training data
     base_freq: Option<[u32; 256]>,
@@ -52,8 +102,20 @@ impl PPM {
                 None => continue,
             };
             let tbl = &mut self.ctx[order];
-            let d = tbl.entry(h).or_default();
-            *d.entry(byte).or_insert(0) += 1;
+            let d = tbl.entry(h).or_insert_with(SymCounts::new);
+            d.increment(byte);
+        }
+        self.hist.push(byte);
+    }
+
+    /// Update context tables using pre-computed order hashes.
+    pub(crate) fn update_cached(&mut self, byte: u8, order_hashes: &[u32; 7], max_order: usize) {
+        let limit = std::cmp::min(self.mo + 1, max_order);
+        for order in 0..limit {
+            let h = order_hashes[order];
+            let tbl = &mut self.ctx[order];
+            let d = tbl.entry(h).or_insert_with(SymCounts::new);
+            d.increment(byte);
         }
         self.hist.push(byte);
     }
@@ -153,6 +215,25 @@ impl PPM {
 
     /// Compute KN-smoothed float distribution over all 256 bytes.
     pub(crate) fn distribution_f(&self) -> [f64; 256] {
+        // Compute hashes internally
+        let mut hashes = [0u32; 7];
+        let n = self.hist.len();
+        let max_order = std::cmp::min(self.mo + 1, n + 1);
+        for order in 0..max_order {
+            hashes[order] = match self.hash(order) {
+                Some(h) => h,
+                None => 0,
+            };
+        }
+        self.distribution_f_cached(&hashes, max_order)
+    }
+
+    /// Compute KN-smoothed float distribution using pre-computed order hashes.
+    pub(crate) fn distribution_f_cached(
+        &self,
+        order_hashes: &[u32; 7],
+        max_order: usize,
+    ) -> [f64; 256] {
         let base_arr: &[u32; 256] = match &self.base_freq {
             Some(bf) => bf,
             None => &CHAR_FREQ,
@@ -173,16 +254,14 @@ impl PPM {
             dist[b] = mixed[b] as f64 * inv_freq_total;
         }
 
-        for order in 0..=self.mo {
-            let h = match self.hash(order) {
-                Some(h) => h,
-                None => continue,
-            };
+        let limit = std::cmp::min(self.mo + 1, max_order);
+        for order in 0..limit {
+            let h = order_hashes[order];
             let d = match self.ctx[order].get(&h) {
                 Some(d) => d,
                 None => continue,
             };
-            let c_total: u32 = d.values().sum();
+            let c_total = d.total();
             if c_total == 0 {
                 continue;
             }
@@ -196,7 +275,7 @@ impl PPM {
                 new_dist[b] = lam * dist[b];
             }
             // Add direct counts only for symbols present in context
-            for (&sym, &count) in d.iter() {
+            for &(sym, count) in d.iter() {
                 let direct = (count as f64 - DISCOUNT).max(0.0) * inv_c_total;
                 new_dist[sym as usize] += direct;
             }

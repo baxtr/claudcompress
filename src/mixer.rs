@@ -55,7 +55,7 @@ fn init_tables() {
 fn stretch_fast(p: f64) -> f64 {
     let idx = (p * STRETCH_TABLE_SIZE as f64) as usize;
     let idx = idx.min(STRETCH_TABLE_SIZE);
-    unsafe { STRETCH_LUT[idx] }
+    unsafe { *STRETCH_LUT.get_unchecked(idx) }
 }
 
 #[inline(always)]
@@ -68,7 +68,7 @@ fn squash_fast(x: f64) -> f64 {
     }
     let idx = ((x + SQUASH_RANGE) / (2.0 * SQUASH_RANGE) * SQUASH_TABLE_SIZE as f64) as usize;
     let idx = idx.min(SQUASH_TABLE_SIZE);
-    unsafe { SQUASH_LUT[idx] }
+    unsafe { *SQUASH_LUT.get_unchecked(idx) }
 }
 
 /// Context mixer with 13 models, linear mixing + residual NN correction.
@@ -155,13 +155,20 @@ impl ContextMixer {
 
         for &byte in data {
             let mut node: u32 = 1;
+            let n = self.hist.len();
+            let max_order = std::cmp::min(self.mo + 1, n + 1);
+
+            // Precompute byte-level hashes once per byte
+            let (byte_bases, active) = self.precompute_byte_hashes(n, max_order);
+
             for bit_pos in 0..8u32 {
                 let bit = ((byte >> (7 - bit_pos)) & 1) as usize;
-                // Update all bit models during pretrain
-                let (hashes, n_active) = self.compute_all_hashes(node);
-                for m in 0..n_active {
-                    let idx = (hashes[m] & BIT_TABLE_MASK) as usize;
-                    let entry = &mut self.bit_table[idx];
+                let node_part = node.wrapping_mul(2654435761);
+
+                for m in 0..N_BIT_MODELS {
+                    let h = if active[m] { byte_bases[m] ^ node_part } else { 0 };
+                    let idx = (h & BIT_TABLE_MASK) as usize;
+                    let entry = unsafe { self.bit_table.get_unchecked_mut(idx) };
                     entry[bit] = entry[bit].saturating_add(1);
                 }
                 node = node * 2 + bit as u32;
@@ -186,41 +193,38 @@ impl ContextMixer {
         }
     }
 
-    /// Compute all bit model hashes. Returns (hashes, n_active).
-    /// Layout: [order0..order6, skip1, skip2, sparse, word, match]
+    /// Precompute byte-level base hashes (constant across all 8 bit positions).
+    /// Returns (base_hashes, active_mask). Final bit hash = base ^ node_part.
     #[inline(always)]
-    fn compute_all_hashes(&self, node: u32) -> ([u32; N_BIT_MODELS], usize) {
-        let n = self.hist.len();
-        let mut hashes = [0u32; N_BIT_MODELS];
-        let node_part = node.wrapping_mul(2654435761);
-        let max_order = std::cmp::min(self.mo + 1, n + 1);
-        let mut n_active = 0usize;
+    fn precompute_byte_hashes(
+        &self,
+        n: usize,
+        max_order: usize,
+    ) -> ([u32; N_BIT_MODELS], [bool; N_BIT_MODELS]) {
+        let mut base = [0u32; N_BIT_MODELS];
+        let mut active = [false; N_BIT_MODELS];
 
-        // Orders 0..max_order
+        // Order models: base = fnv_hash * FNV_PRIME
         for order in 0..max_order {
             let byte_h = if order == 0 {
                 0u32
             } else {
                 fnv(&self.hist, n - order, n)
             };
-            hashes[n_active] = byte_h.wrapping_mul(16777619) ^ node_part;
-            n_active += 1;
+            base[order] = byte_h.wrapping_mul(16777619);
+            active[order] = true;
         }
+        // Inactive orders: active stays false, hash stays 0
 
-        // Pad remaining orders with sentinel (won't be used for predict/update)
-        let order_end = N_ORDER_MODELS;
-        for _ in max_order..N_ORDER_MODELS {
-            // Skip — these indices stay at 0, gather_preds will use 0.5
-            n_active += 1;
-        }
+        let oe = N_ORDER_MODELS; // order_end
 
-        // Extra model index base = N_ORDER_MODELS = 7
-        // Skip-1: hash(byte[-1], byte[-3]) — captures patterns with gaps
+        // Skip-1: hash(byte[-1], byte[-3])
         if n >= 3 {
             let h = (self.hist[n - 1] as u32)
                 .wrapping_mul(16777619)
                 ^ (self.hist[n - 3] as u32).wrapping_mul(2654435761);
-            hashes[order_end] = h.wrapping_mul(16777619) ^ node_part ^ 0x12345678;
+            base[oe] = h.wrapping_mul(16777619) ^ 0x12345678;
+            active[oe] = true;
         }
 
         // Skip-2: hash(byte[-1], byte[-4])
@@ -228,7 +232,8 @@ impl ContextMixer {
             let h = (self.hist[n - 1] as u32)
                 .wrapping_mul(16777619)
                 ^ (self.hist[n - 4] as u32).wrapping_mul(2654435761);
-            hashes[order_end + 1] = h.wrapping_mul(16777619) ^ node_part ^ 0x23456789;
+            base[oe + 1] = h.wrapping_mul(16777619) ^ 0x23456789;
+            active[oe + 1] = true;
         }
 
         // Sparse: hash(byte[-2], byte[-4])
@@ -236,15 +241,17 @@ impl ContextMixer {
             let h = (self.hist[n - 2] as u32)
                 .wrapping_mul(16777619)
                 ^ (self.hist[n - 4] as u32).wrapping_mul(2654435761);
-            hashes[order_end + 2] = h.wrapping_mul(16777619) ^ node_part ^ 0x3456789A;
+            base[oe + 2] = h.wrapping_mul(16777619) ^ 0x3456789A;
+            active[oe + 2] = true;
         }
 
         // Word context
         if self.word_hash != 0 {
-            hashes[order_end + 3] = self.word_hash.wrapping_mul(16777619) ^ node_part ^ 0x456789AB;
+            base[oe + 3] = self.word_hash.wrapping_mul(16777619) ^ 0x456789AB;
+            active[oe + 3] = true;
         }
 
-        // Match model: hash(predicted_byte, match_length_bucket)
+        // Match model
         if self.lzp.pred >= 0 && self.lzp.pred_len >= 4 {
             let len_bucket = if self.lzp.pred_len >= 16 {
                 3u32
@@ -256,11 +263,28 @@ impl ContextMixer {
             let h = (self.lzp.pred as u32)
                 .wrapping_mul(16777619)
                 ^ len_bucket.wrapping_mul(2654435761);
-            hashes[order_end + 4] = h.wrapping_mul(16777619) ^ node_part ^ 0x56789ABC;
+            base[oe + 4] = h.wrapping_mul(16777619) ^ 0x56789ABC;
+            active[oe + 4] = true;
         }
 
-        // Total active = all N_BIT_MODELS (inactive ones have hash 0 -> predict ~0.5)
-        (hashes, N_BIT_MODELS)
+        (base, active)
+    }
+
+    /// Combine precomputed byte bases with bit-tree node to get final hashes.
+    #[inline(always)]
+    fn make_bit_hashes(
+        byte_bases: &[u32; N_BIT_MODELS],
+        active: &[bool; N_BIT_MODELS],
+        node: u32,
+    ) -> [u32; N_BIT_MODELS] {
+        let node_part = node.wrapping_mul(2654435761);
+        let mut hashes = [0u32; N_BIT_MODELS];
+        for i in 0..N_BIT_MODELS {
+            if active[i] {
+                hashes[i] = byte_bases[i] ^ node_part;
+            }
+        }
+        hashes
     }
 
     #[inline(always)]
@@ -269,8 +293,8 @@ impl ContextMixer {
         let lo = ((node - (1 << depth)) << (8 - depth)) as usize;
         let hi = lo + (1usize << (8 - depth));
         let mid = (lo + hi) / 2;
-        let p0 = ppm_cum[mid] - ppm_cum[lo];
-        let p1 = ppm_cum[hi] - ppm_cum[mid];
+        let p0 = unsafe { *ppm_cum.get_unchecked(mid) - *ppm_cum.get_unchecked(lo) };
+        let p1 = unsafe { *ppm_cum.get_unchecked(hi) - *ppm_cum.get_unchecked(mid) };
         let total = p0 + p1;
         if total > 1e-10 {
             p1 / total
@@ -281,7 +305,7 @@ impl ContextMixer {
 
     #[inline(always)]
     fn bit_predict_direct(&self, h: u32) -> f64 {
-        let entry = &self.bit_table[(h & BIT_TABLE_MASK) as usize];
+        let entry = unsafe { self.bit_table.get_unchecked((h & BIT_TABLE_MASK) as usize) };
         let total = (entry[0] as u32 + entry[1] as u32) as f64;
         if total == 0.0 {
             0.5
@@ -292,7 +316,7 @@ impl ContextMixer {
 
     #[inline(always)]
     fn bit_update_direct(&mut self, h: u32, bit: usize) {
-        let entry = &mut self.bit_table[(h & BIT_TABLE_MASK) as usize];
+        let entry = unsafe { self.bit_table.get_unchecked_mut((h & BIT_TABLE_MASK) as usize) };
         entry[bit] = entry[bit].saturating_add(1);
         if entry[0] as u32 + entry[1] as u32 > 16 {
             entry[0] = (entry[0] + 1) >> 1;
@@ -369,10 +393,10 @@ impl ContextMixer {
         }
     }
 
-    fn build_cum(&self) -> [f64; 257] {
+    fn build_cum_cached(&self, order_hashes: &[u32; 7], max_order: usize) -> [f64; 257] {
         let match_byte = self.lzp.pred;
         let match_len = self.lzp.pred_len;
-        let mut dist = self.ppm.distribution_f();
+        let mut dist = self.ppm.distribution_f_cached(order_hashes, max_order);
 
         if match_byte >= 0 && match_len >= 4 {
             let lzp_w = (match_len as f64 * 0.01).min(0.25);
@@ -409,11 +433,28 @@ impl ContextMixer {
     }
 
     pub fn encode_byte(&mut self, byte: u8, enc: &mut AEnc) {
-        let ppm_cum = self.build_cum();
+        let n = self.hist.len();
+        let max_order = std::cmp::min(self.mo + 1, n + 1);
+
+        // Extract order hashes for PPM (shared computation)
+        let mut order_hashes = [0u32; 7];
+        for order in 0..max_order {
+            order_hashes[order] = if order == 0 {
+                0u32
+            } else {
+                fnv(&self.hist, n - order, n)
+            };
+        }
+
+        let ppm_cum = self.build_cum_cached(&order_hashes, max_order);
+
+        // Precompute byte-level hashes once (constant across all 8 bits)
+        let (byte_bases, active) = self.precompute_byte_hashes(n, max_order);
+
         let mut node: u32 = 1;
         for bit_pos in 0..8 {
             let bit = (byte >> (7 - bit_pos)) & 1;
-            let (hashes, n_active) = self.compute_all_hashes(node);
+            let hashes = Self::make_bit_hashes(&byte_bases, &active, node);
             let preds = self.gather_preds(node, &ppm_cum, &hashes);
 
             let (mixed, stretched, hidden) = self.forward(bit_pos, &preds);
@@ -436,23 +477,40 @@ impl ContextMixer {
             self.sse[bit_pos][bin] += SSE_RATE * (target - self.sse[bit_pos][bin]);
             self.sse[bit_pos][bin + 1] += SSE_RATE * (target - self.sse[bit_pos][bin + 1]);
 
-            for m in 0..n_active {
+            for m in 0..N_BIT_MODELS {
                 self.bit_update_direct(hashes[m], bit as usize);
             }
             node = node * 2 + bit as u32;
         }
-        self.ppm.update(byte);
+        self.ppm.update_cached(byte, &order_hashes, max_order);
         self.lzp.update(byte);
         self.update_word_hash(byte);
         self.hist.push(byte);
     }
 
     pub fn decode_byte(&mut self, dec: &mut ADec) -> u8 {
-        let ppm_cum = self.build_cum();
+        let n = self.hist.len();
+        let max_order = std::cmp::min(self.mo + 1, n + 1);
+
+        // Extract order hashes for PPM (shared computation)
+        let mut order_hashes = [0u32; 7];
+        for order in 0..max_order {
+            order_hashes[order] = if order == 0 {
+                0u32
+            } else {
+                fnv(&self.hist, n - order, n)
+            };
+        }
+
+        let ppm_cum = self.build_cum_cached(&order_hashes, max_order);
+
+        // Precompute byte-level hashes once
+        let (byte_bases, active) = self.precompute_byte_hashes(n, max_order);
+
         let mut node: u32 = 1;
         let mut byte_val: u8 = 0;
         for bit_pos in 0..8 {
-            let (hashes, n_active) = self.compute_all_hashes(node);
+            let hashes = Self::make_bit_hashes(&byte_bases, &active, node);
             let preds = self.gather_preds(node, &ppm_cum, &hashes);
 
             let (mixed, stretched, hidden) = self.forward(bit_pos, &preds);
@@ -475,13 +533,13 @@ impl ContextMixer {
             self.sse[bit_pos][bin] += SSE_RATE * (target - self.sse[bit_pos][bin]);
             self.sse[bit_pos][bin + 1] += SSE_RATE * (target - self.sse[bit_pos][bin + 1]);
 
-            for m in 0..n_active {
+            for m in 0..N_BIT_MODELS {
                 self.bit_update_direct(hashes[m], bit as usize);
             }
             byte_val = (byte_val << 1) | bit;
             node = node * 2 + bit as u32;
         }
-        self.ppm.update(byte_val);
+        self.ppm.update_cached(byte_val, &order_hashes, max_order);
         self.lzp.update(byte_val);
         self.update_word_hash(byte_val);
         self.hist.push(byte_val);
