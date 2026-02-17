@@ -9,7 +9,6 @@ pub mod lzp;
 pub mod mixer;
 pub mod format;
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use bitio::{BitWriter, BitReader};
 use arithmetic::{AEnc, ADec};
 use mixer::ContextMixer;
@@ -62,30 +61,20 @@ pub fn quantum_compress_threads(text: &str, threads: usize) -> Vec<u8> {
     let mut base_cm = ContextMixer::with_default_order();
     base_cm.pretrain(&pretrain_data);
 
-    let progress = AtomicUsize::new(0);
-
     // Compress blocks in parallel
     let compressed_blocks: Vec<Vec<u8>> = std::thread::scope(|s| {
-        let handles: Vec<_> = blocks.iter().enumerate().map(|(idx, block)| {
+        let handles: Vec<_> = blocks.iter().map(|block| {
             let mut cm = base_cm.clone();
-            let progress = &progress;
             s.spawn(move || {
                 let mut bw = BitWriter::new();
                 {
                     let mut enc = AEnc::new(&mut bw);
-                    for (j, &byte) in block.iter().enumerate() {
+                    for &byte in block.iter() {
                         cm.encode_byte(byte, &mut enc);
-                        if j % 1024 == 0 {
-                            progress.fetch_add(1024, Ordering::Relaxed);
-                        }
                     }
                     enc.finish();
                 }
-                let result = bw.data().to_vec();
-                if idx == 0 {
-                    eprintln!("\r  Block 0 done ({} bytes)", result.len());
-                }
-                result
+                bw.data().to_vec()
             })
         }).collect();
 
@@ -210,7 +199,7 @@ fn decompress_v8(pretrain_data: &[u8], orig_len: usize, br: BitReader) -> Vec<u8
     result
 }
 
-fn decompress_v9(data: &[u8], pretrain_data: &[u8], threads: usize) -> Result<Vec<u8>, String> {
+fn decompress_v9(data: &[u8], pretrain_data: &[u8], _threads: usize) -> Result<Vec<u8>, String> {
     let (_total_len, block_meta) = format::read_header_v9(data)?;
     let num_blocks = block_meta.len();
     let hdr_size = format::header_size_v9(num_blocks);
@@ -222,13 +211,6 @@ fn decompress_v9(data: &[u8], pretrain_data: &[u8], threads: usize) -> Result<Ve
         block_offsets.push(offset);
         offset += compressed_len as usize;
     }
-
-    let num_threads = if threads > 0 {
-        threads
-    } else {
-        std::thread::available_parallelism().map(|p| p.get()).unwrap_or(1)
-    };
-    let _ = num_threads; // all blocks decompress in parallel regardless
 
     eprintln!("  Decompressing {} blocks in parallel...", num_blocks);
 
